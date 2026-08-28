@@ -1,15 +1,10 @@
-name: Build & Release
+name: Build Master Release
 
-run-name: Build and release ${{ inputs.release_tag || 'custom-nightly' }}
+run-name: Build master -> custom-nightly (${{ inputs.trigger_source || 'push' }})
 
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: Release tag to create or update
-        required: false
-        default: custom-nightly
-        type: string
       trigger_source:
         description: What triggered this build
         required: false
@@ -28,7 +23,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: rustdesk-release-${{ inputs.release_tag || 'custom-nightly' }}
+  group: rustdesk-release-custom-nightly
   cancel-in-progress: false
 
 jobs:
@@ -37,4 +32,4 @@ jobs:
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: ${{ inputs.release_tag || 'custom-nightly' }}
+      upload-tag: custom-nightly
