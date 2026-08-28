@@ -1,0 +1,96 @@
+name: Sync Upstream
+
+run-name: Sync rustdesk/rustdesk master
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream-master
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/rustdesk/rustdesk.git || true
+          git fetch upstream master --tags
+
+      - name: Check and merge upstream changes
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BEFORE="$(git rev-parse HEAD)"
+          UPSTREAM="$(git rev-parse upstream/master)"
+
+          echo "fork_before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$UPSTREAM" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork already contains upstream/master; nothing to sync."
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor HEAD "$UPSTREAM"; then
+            echo "Fast-forwarding master to upstream/master"
+            git merge --ff-only upstream/master
+          else
+            echo "Fork has local commits; merging upstream/master"
+            git merge --no-edit upstream/master
+          fi
+
+          AFTER="$(git rev-parse HEAD)"
+          echo "fork_after=$AFTER" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push synchronized master
+        if: steps.sync.outputs.changed == 'true'
+        run: git push origin master --follow-tags
+
+      - name: Trigger multi-platform release build
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run build-release.yml \
+            --ref master \
+            -f release_tag=custom-nightly \
+            -f trigger_source=upstream-sync
+
+      - name: Summary
+        shell: bash
+        run: |
+          if [[ "${{ steps.sync.outputs.changed }}" == "true" ]]; then
+            echo "### Upstream synchronized" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Upstream: \`${{ steps.sync.outputs.upstream }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Release workflow: \`build-release.yml\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Release tag: \`custom-nightly\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### No upstream changes" >> "$GITHUB_STEP_SUMMARY"
+            echo "The fork already contains the latest \`rustdesk/rustdesk:master\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
