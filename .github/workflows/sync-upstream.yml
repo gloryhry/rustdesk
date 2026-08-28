@@ -1,6 +1,6 @@
 name: Sync Upstream
 
-run-name: Sync rustdesk/rustdesk master
+run-name: Sync rustdesk/rustdesk master and tags
 
 on:
   schedule:
@@ -14,6 +14,9 @@ permissions:
 concurrency:
   group: sync-upstream-master
   cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: rustdesk/rustdesk
 
 jobs:
   sync:
@@ -32,12 +35,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream
+      - name: Fetch fork and upstream
+        shell: bash
         run: |
-          git remote add upstream https://github.com/rustdesk/rustdesk.git || true
-          git fetch upstream master --tags
+          set -euo pipefail
+          git remote add upstream https://github.com/${UPSTREAM_REPO}.git || true
 
-      - name: Check and merge upstream changes
+          # Refresh fork refs first, then fetch the authoritative upstream master.
+          git fetch origin master --tags
+          git fetch upstream master
+
+      - name: Check and merge upstream master
         id: sync
         shell: bash
         run: |
@@ -51,7 +59,7 @@ jobs:
 
           if git merge-base --is-ancestor "$UPSTREAM" HEAD; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Fork already contains upstream/master; nothing to sync."
+            echo "Fork already contains upstream/master; nothing to merge."
             exit 0
           fi
 
@@ -69,28 +77,195 @@ jobs:
 
       - name: Push synchronized master
         if: steps.sync.outputs.changed == 'true'
-        run: git push origin master --follow-tags
+        run: git push origin master
 
-      - name: Trigger multi-platform release build
+      - name: Detect and synchronize upstream tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          origin_tags="$(mktemp)"
+          upstream_tags="$(mktemp)"
+          changed_tags="$(mktemp)"
+          trap 'rm -f "$origin_tags" "$upstream_tags" "$changed_tags"' EXIT
+
+          git ls-remote --tags --refs origin \
+            | awk '{sub("refs/tags/", "", $2); print $2 " " $1}' \
+            | sort > "$origin_tags"
+
+          git ls-remote --tags --refs upstream \
+            | awk '{sub("refs/tags/", "", $2); print $2 " " $1}' \
+            | sort > "$upstream_tags"
+
+          # Record tags that are new in the fork or whose upstream target changed.
+          awk '
+            NR==FNR { origin[$1]=$2; next }
+            !($1 in origin) || origin[$1] != $2 { print $1 }
+          ' "$origin_tags" "$upstream_tags" > "$changed_tags"
+
+          count="$(wc -l < "$changed_tags" | tr -d ' ')"
+          echo "changed_count=$count" >> "$GITHUB_OUTPUT"
+
+          if [[ "$count" == "0" ]]; then
+            echo "No upstream tag changes."
+            exit 0
+          fi
+
+          echo "Upstream tags to synchronize:"
+          cat "$changed_tags"
+
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            git fetch upstream "+refs/tags/$tag:refs/tags/$tag"
+            git push origin "+refs/tags/$tag:refs/tags/$tag"
+          done < "$changed_tags"
+
+          {
+            echo 'changed_tags<<EOF'
+            cat "$changed_tags"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Find upstream releases that need rebuilding
+        id: releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          upstream_json="$(mktemp)"
+          fork_json="$(mktemp)"
+          pending="$(mktemp)"
+          trap 'rm -f "$upstream_json" "$fork_json" "$pending"' EXIT
+
+          # We only mirror versioned published releases. The rolling `nightly`
+          # prerelease continues to be handled by custom-nightly on master.
+          gh api --paginate "repos/$UPSTREAM_REPO/releases?per_page=100" \
+            | jq -s '[add[] | select(.draft == false) | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9]+)?$"))] | sort_by(.published_at)' \
+            > "$upstream_json"
+
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            | jq -s '[add[] | select(.draft == false) | .tag_name]' \
+            > "$fork_json"
+
+          upstream_count="$(jq 'length' "$upstream_json")"
+          if [[ "$upstream_count" == "0" ]]; then
+            echo "No versioned upstream releases found."
+            echo "pending_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Determine the latest upstream publication time already rebuilt in this fork.
+          # If the fork has no versioned releases yet, bootstrap with only the newest
+          # upstream release instead of rebuilding the entire historical catalog.
+          watermark="$(jq -r --slurpfile fork "$fork_json" '
+            [ .[] | select(.tag_name as $t | $fork[0] | index($t)) | .published_at ]
+            | max // empty
+          ' "$upstream_json")"
+
+          if [[ -z "$watermark" ]]; then
+            jq -r '.[-1].tag_name' "$upstream_json" > "$pending"
+          else
+            jq -r --arg watermark "$watermark" '
+              .[] | select(.published_at > $watermark) | .tag_name
+            ' "$upstream_json" > "$pending"
+          fi
+
+          # Also include tags synchronized in this run if their upstream Release appeared
+          # at the same time, even if publication timestamps are unusual.
+          if [[ -n "${{ steps.tags.outputs.changed_tags }}" ]]; then
+            while IFS= read -r tag; do
+              [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]] || continue
+              if jq -e --arg tag "$tag" '.[] | select(.tag_name == $tag)' "$upstream_json" >/dev/null; then
+                echo "$tag" >> "$pending"
+              fi
+            done <<< "${{ steps.tags.outputs.changed_tags }}"
+          fi
+
+          sort -u -o "$pending" "$pending"
+
+          # Do not retrigger a release that already exists in the fork.
+          filtered="$(mktemp)"
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            if jq -e --arg tag "$tag" 'index($tag)' "$fork_json" >/dev/null; then
+              continue
+            fi
+            echo "$tag" >> "$filtered"
+          done < "$pending"
+          mv "$filtered" "$pending"
+
+          count="$(wc -l < "$pending" | tr -d ' ')"
+          echo "pending_count=$count" >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'pending_tags<<EOF'
+            cat "$pending"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$count" != "0" ]]; then
+            echo "Versioned releases to rebuild from their tags:"
+            cat "$pending"
+          else
+            echo "No upstream versioned releases need rebuilding."
+          fi
+
+      - name: Rebuild and publish upstream releases from tags
+        if: steps.releases.outputs.pending_count != '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+              echo "ERROR: tag $tag is not present in the fork; refusing to build the wrong source."
+              exit 1
+            fi
+
+            echo "Dispatching Flutter Tag Build for $tag"
+            gh workflow run flutter-tag.yml \
+              --repo "$GH_REPO" \
+              --ref "$tag"
+          done <<< "${{ steps.releases.outputs.pending_tags }}"
+
+      - name: Trigger custom nightly build for master changes
         if: steps.sync.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           gh workflow run build-release.yml \
+            --repo "$GH_REPO" \
             --ref master \
-            -f release_tag=custom-nightly \
             -f trigger_source=upstream-sync
 
       - name: Summary
         shell: bash
         run: |
+          echo "### Upstream synchronization" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Master changed: \`${{ steps.sync.outputs.changed }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tags synchronized: \`${{ steps.tags.outputs.changed_count }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Versioned releases dispatched: \`${{ steps.releases.outputs.pending_count }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${{ steps.releases.outputs.pending_count }}" != "0" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "#### Release tags rebuilt from source" >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r tag; do
+              [[ -n "$tag" ]] && echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+            done <<< "${{ steps.releases.outputs.pending_tags }}"
+          fi
+
           if [[ "${{ steps.sync.outputs.changed }}" == "true" ]]; then
-            echo "### Upstream synchronized" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Upstream: \`${{ steps.sync.outputs.upstream }}\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Release workflow: \`build-release.yml\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Release tag: \`custom-nightly\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Master build: \`custom-nightly\` dispatched" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### No upstream changes" >> "$GITHUB_STEP_SUMMARY"
-            echo "The fork already contains the latest \`rustdesk/rustdesk:master\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Master build: not dispatched (master unchanged)" >> "$GITHUB_STEP_SUMMARY"
           fi
