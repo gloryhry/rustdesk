@@ -1,6 +1,6 @@
 name: Sync Upstream
 
-run-name: Sync rustdesk/rustdesk master and tags
+run-name: Sync rustdesk/rustdesk master, hbb_common and tags
 
 on:
   schedule:
@@ -17,63 +17,148 @@ concurrency:
 
 env:
   UPSTREAM_REPO: rustdesk/rustdesk
+  HBB_FORK_REPO: gloryhry/hbb_common
+  HBB_UPSTREAM_REPO: rustdesk/hbb_common
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@v4
+      - name: Checkout RustDesk fork
+        uses: actions/checkout@v5
         with:
           ref: master
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
           persist-credentials: true
 
+      - name: Checkout hbb_common fork
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.HBB_FORK_REPO }}
+          ref: main
+          path: _sync_hbb_common
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+          persist-credentials: true
+
       - name: Configure Git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch fork and upstream
+      - name: Sync hbb_common with upstream
+        id: hbb
+        shell: bash
+        working-directory: _sync_hbb_common
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${HBB_UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${HBB_UPSTREAM_REPO}.git"
+          git fetch upstream main
+
+          before="$(git rev-parse HEAD)"
+          upstream="$(git rev-parse upstream/main)"
+
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "hbb_common already contains upstream/main"
+          elif git merge-base --is-ancestor HEAD "$upstream"; then
+            git merge --ff-only upstream/main
+          else
+            # Preserve our custom server/public-key policy while incorporating
+            # upstream changes. Real source conflicts must be handled explicitly.
+            if ! git merge --no-edit upstream/main; then
+              echo "::error::hbb_common has a real merge conflict. Resolve it in gloryhry/hbb_common first."
+              git status --short
+              exit 1
+            fi
+          fi
+
+          after="$(git rev-parse HEAD)"
+          echo "sha=$after" >> "$GITHUB_OUTPUT"
+
+          if [[ "$before" != "$after" ]]; then
+            git push origin main
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch RustDesk upstream
         shell: bash
         run: |
           set -euo pipefail
-          git remote add upstream https://github.com/${UPSTREAM_REPO}.git || true
-
-          # Refresh fork refs first, then fetch the authoritative upstream master.
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch origin master --tags
           git fetch upstream master
 
-      - name: Check and merge upstream master
+      - name: Merge upstream master and keep fork customizations
         id: sync
         shell: bash
+        env:
+          HBB_SHA: ${{ steps.hbb.outputs.sha }}
         run: |
           set -euo pipefail
 
-          BEFORE="$(git rev-parse HEAD)"
-          UPSTREAM="$(git rev-parse upstream/master)"
+          before="$(git rev-parse HEAD)"
+          upstream="$(git rev-parse upstream/master)"
+          echo "fork_before=$before" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
 
-          echo "fork_before=$BEFORE" >> "$GITHUB_OUTPUT"
-          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
-
-          if git merge-base --is-ancestor "$UPSTREAM" HEAD; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Fork already contains upstream/master; nothing to merge."
-            exit 0
-          fi
-
-          if git merge-base --is-ancestor HEAD "$UPSTREAM"; then
-            echo "Fast-forwarding master to upstream/master"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            # Upstream code is already present, but the hbb_common fork may have moved.
+            current_hbb="$(git ls-tree HEAD libs/hbb_common | awk '{print $3}')"
+            if [[ "$current_hbb" == "$HBB_SHA" ]]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "Fork already contains upstream/master and current hbb_common."
+              exit 0
+            fi
+            git update-index --cacheinfo 160000,"$HBB_SHA",libs/hbb_common
+            git commit -m "chore: update customized hbb_common"
+          elif git merge-base --is-ancestor HEAD "$upstream"; then
             git merge --ff-only upstream/master
+
+            # Re-apply fork-owned files after a pure upstream fast-forward.
+            git checkout "$before" -- .gitmodules .github/workflows/sync-upstream.yml .github/workflows/build-release.yml
+            git update-index --cacheinfo 160000,"$HBB_SHA",libs/hbb_common
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: restore fork customizations after upstream sync"
+            fi
           else
-            echo "Fork has local commits; merging upstream/master"
-            git merge --no-edit upstream/master
+            # Start the merge but do not let Git guess how to resolve our customized submodule.
+            set +e
+            git merge --no-commit --no-ff upstream/master
+            merge_rc=$?
+            set -e
+
+            # These files are owned by this fork and intentionally differ from upstream.
+            git checkout HEAD -- .gitmodules .github/workflows/sync-upstream.yml .github/workflows/build-release.yml
+            git add .gitmodules .github/workflows/sync-upstream.yml .github/workflows/build-release.yml
+
+            # The superproject must point at the synchronized customized hbb_common fork.
+            git update-index --cacheinfo 160000,"$HBB_SHA",libs/hbb_common
+
+            unresolved="$(git diff --name-only --diff-filter=U)"
+            if [[ -n "$unresolved" ]]; then
+              echo "::error::Upstream introduced source conflicts outside the known customized files:"
+              echo "$unresolved"
+              git merge --abort || true
+              exit 1
+            fi
+
+            if [[ ! -f .git/MERGE_HEAD ]]; then
+              echo "::error::git merge failed before creating a merge state (exit $merge_rc)."
+              exit "$merge_rc"
+            fi
+
+            git commit -m "Merge upstream/master while preserving fork customizations"
           fi
 
-          AFTER="$(git rev-parse HEAD)"
-          echo "fork_after=$AFTER" >> "$GITHUB_OUTPUT"
+          after="$(git rev-parse HEAD)"
+          echo "fork_after=$after" >> "$GITHUB_OUTPUT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Push synchronized master
@@ -94,12 +179,10 @@ jobs:
           git ls-remote --tags --refs origin \
             | awk '{sub("refs/tags/", "", $2); print $2 " " $1}' \
             | sort > "$origin_tags"
-
           git ls-remote --tags --refs upstream \
             | awk '{sub("refs/tags/", "", $2); print $2 " " $1}' \
             | sort > "$upstream_tags"
 
-          # Record tags that are new in the fork or whose upstream target changed.
           awk '
             NR==FNR { origin[$1]=$2; next }
             !($1 in origin) || origin[$1] != $2 { print $1 }
@@ -107,14 +190,6 @@ jobs:
 
           count="$(wc -l < "$changed_tags" | tr -d ' ')"
           echo "changed_count=$count" >> "$GITHUB_OUTPUT"
-
-          if [[ "$count" == "0" ]]; then
-            echo "No upstream tag changes."
-            exit 0
-          fi
-
-          echo "Upstream tags to synchronize:"
-          cat "$changed_tags"
 
           while IFS= read -r tag; do
             [[ -n "$tag" ]] || continue
@@ -142,26 +217,19 @@ jobs:
           pending="$(mktemp)"
           trap 'rm -f "$upstream_json" "$fork_json" "$pending"' EXIT
 
-          # We only mirror versioned published releases. The rolling `nightly`
-          # prerelease continues to be handled by custom-nightly on master.
           gh api --paginate "repos/$UPSTREAM_REPO/releases?per_page=100" \
             | jq -s '[add[] | select(.draft == false) | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9]+)?$"))] | sort_by(.published_at)' \
             > "$upstream_json"
-
           gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
             | jq -s '[add[] | select(.draft == false) | .tag_name]' \
             > "$fork_json"
 
           upstream_count="$(jq 'length' "$upstream_json")"
           if [[ "$upstream_count" == "0" ]]; then
-            echo "No versioned upstream releases found."
             echo "pending_count=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Determine the latest upstream publication time already rebuilt in this fork.
-          # If the fork has no versioned releases yet, bootstrap with only the newest
-          # upstream release instead of rebuilding the entire historical catalog.
           watermark="$(jq -r --slurpfile fork "$fork_json" '
             [ .[] | select(.tag_name as $t | $fork[0] | index($t)) | .published_at ]
             | max // empty
@@ -170,13 +238,9 @@ jobs:
           if [[ -z "$watermark" ]]; then
             jq -r '.[-1].tag_name' "$upstream_json" > "$pending"
           else
-            jq -r --arg watermark "$watermark" '
-              .[] | select(.published_at > $watermark) | .tag_name
-            ' "$upstream_json" > "$pending"
+            jq -r --arg watermark "$watermark" '.[] | select(.published_at > $watermark) | .tag_name' "$upstream_json" > "$pending"
           fi
 
-          # Also include tags synchronized in this run if their upstream Release appeared
-          # at the same time, even if publication timestamps are unusual.
           if [[ -n "${{ steps.tags.outputs.changed_tags }}" ]]; then
             while IFS= read -r tag; do
               [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]] || continue
@@ -187,33 +251,22 @@ jobs:
           fi
 
           sort -u -o "$pending" "$pending"
-
-          # Do not retrigger a release that already exists in the fork.
           filtered="$(mktemp)"
           while IFS= read -r tag; do
             [[ -n "$tag" ]] || continue
-            if jq -e --arg tag "$tag" 'index($tag)' "$fork_json" >/dev/null; then
-              continue
+            if ! jq -e --arg tag "$tag" 'index($tag)' "$fork_json" >/dev/null; then
+              echo "$tag" >> "$filtered"
             fi
-            echo "$tag" >> "$filtered"
           done < "$pending"
           mv "$filtered" "$pending"
 
           count="$(wc -l < "$pending" | tr -d ' ')"
           echo "pending_count=$count" >> "$GITHUB_OUTPUT"
-
           {
             echo 'pending_tags<<EOF'
             cat "$pending"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
-
-          if [[ "$count" != "0" ]]; then
-            echo "Versioned releases to rebuild from their tags:"
-            cat "$pending"
-          else
-            echo "No upstream versioned releases need rebuilding."
-          fi
 
       - name: Rebuild and publish upstream releases from tags
         if: steps.releases.outputs.pending_count != '0'
@@ -223,22 +276,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
           while IFS= read -r tag; do
             [[ -n "$tag" ]] || continue
-
-            if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-              echo "ERROR: tag $tag is not present in the fork; refusing to build the wrong source."
-              exit 1
-            fi
-
-            echo "Dispatching Flutter Tag Build for $tag"
-            gh workflow run flutter-tag.yml \
-              --repo "$GH_REPO" \
-              --ref "$tag"
+            gh workflow run flutter-tag.yml --repo "$GH_REPO" --ref "$tag"
           done <<< "${{ steps.releases.outputs.pending_tags }}"
 
-      - name: Trigger custom nightly build for master changes
+      - name: Trigger custom nightly build for synchronized master
         if: steps.sync.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
@@ -250,23 +293,11 @@ jobs:
             -f trigger_source=upstream-sync
 
       - name: Summary
+        if: always()
         shell: bash
         run: |
           echo "### Upstream synchronization" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Master changed: \`${{ steps.sync.outputs.changed }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Tags synchronized: \`${{ steps.tags.outputs.changed_count }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Versioned releases dispatched: \`${{ steps.releases.outputs.pending_count }}\`" >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ "${{ steps.releases.outputs.pending_count }}" != "0" ]]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "#### Release tags rebuilt from source" >> "$GITHUB_STEP_SUMMARY"
-            while IFS= read -r tag; do
-              [[ -n "$tag" ]] && echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
-            done <<< "${{ steps.releases.outputs.pending_tags }}"
-          fi
-
-          if [[ "${{ steps.sync.outputs.changed }}" == "true" ]]; then
-            echo "- Master build: \`custom-nightly\` dispatched" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- Master build: not dispatched (master unchanged)" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "- hbb_common changed: \`${{ steps.hbb.outputs.changed || 'unknown' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- master changed: \`${{ steps.sync.outputs.changed || 'unknown' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tags synchronized: \`${{ steps.tags.outputs.changed_count || '0' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- releases dispatched: \`${{ steps.releases.outputs.pending_count || '0' }}\`" >> "$GITHUB_STEP_SUMMARY"
