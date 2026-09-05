@@ -659,9 +659,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("screenshot-merged-screen-not-supported-tip", "L'unione della cattura di schermate di più display non è attualmente supportata.\nPassa ad un singolo display e riprova."),
         ("screenshot-action-tip", "Seleziona come continuare con la schermata."),
         ("Save as", "Salva come"),
-        ("Export", ""),
-        ("Export Logs", ""),
-        ("Import Folder", ""),
+        ("Export", "Esporta"),
+        ("Export Logs", "Esporta i log"),
+        ("Import Folder", "Importa cartella"),
         ("Copy to clipboard", "Copia negli appunti"),
         ("Enable remote printer", "Abilita stampante remota"),
         ("Downloading {}", "Download {}"),
@@ -763,5 +763,10 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Blocca tela"),
         ("Sync clipboard between sessions", "Sincronizza gli appunti tra le sessioni"),
         ("sync-clipboard-between-sessions-tip", "Il testo o le immagini copiati in una sessione remota vengono inviati anche agli appunti delle altre sessioni connesse."),
+        ("terminal-clipboard-write-tip", ""),
+        ("Allow terminal apps to copy to clipboard", ""),
+        ("Enable", "Abilita"),
+        ("Reuse one connection for port forwarding", "Riutilizza una sola connessione per l'inoltro delle porte"),
+        ("port-forward-mux-tip", "Fa passare tutte le connessioni di un inoltro di porte su un'unica connessione verso il dispositivo remoto, invece di connettersi e autenticarsi di nuovo per ognuna."),
     ].iter().cloned().collect();
 }
