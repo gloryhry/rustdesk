@@ -224,10 +224,13 @@ libxdo-sys = { path = "libs/libxdo-sys-stub" }
 # a congestion window, as KCP does - on by default, `allow-webrtc-congestion-control` opts back in.
 # Sending that way, a reordering window keeps a chunk that is merely late from being resent on a
 # path that jitters, every DATA chunk asks for its SACK at once so a lost tail is back within an
-# RTT at KCP's RTO floors, and bundles of small chunks stay within the MTU.
+# RTT at KCP's RTO floors, and bundles of small chunks stay within the MTU. A T3-rtx resends
+# everything outstanding when it packs into four packets and otherwise probes with one and lets
+# the SACK settle the rest (F-RTO), timed from the latest send, so a stall no longer resends the
+# whole backlog behind itself while a short lost tail still comes back at once.
 # Pinned by rev, not branch: a fork branch can be rewritten out from under the lockfile.
-webrtc-util = { git = "https://github.com/rustdesk-org/webrtc", rev = "48100bf13e694d7e5bbb49b9a753dbad1c359d0c" }
-webrtc-sctp = { git = "https://github.com/rustdesk-org/webrtc", rev = "48100bf13e694d7e5bbb49b9a753dbad1c359d0c" }
+webrtc-util = { git = "https://github.com/rustdesk-org/webrtc", rev = "b221f13b1d6f21fbce09f9f63096be27dd392265" }
+webrtc-sctp = { git = "https://github.com/rustdesk-org/webrtc", rev = "b221f13b1d6f21fbce09f9f63096be27dd392265" }
 
 [package.metadata.winres]
 LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."
