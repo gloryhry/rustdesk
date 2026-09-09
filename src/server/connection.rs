@@ -299,6 +299,12 @@ pub struct Connection {
     tx_input: std_mpsc::Sender<MessageInput>,
     // handle input messages
     video_ack_required: bool,
+    // Diagnostics only, gated by `RUSTDESK_QOS_VERBOSE`: how long the shared
+    // write path blocked this second.  The video send is inline in the message
+    // loop, so a slow write also delays the delay probe and its reply.
+    video_send_max_ms: u32,
+    video_send_sum_ms: u32,
+    video_send_count: u32,
     server_audit_conn: String,
     server_audit_file: String,
     controlled_context: Option<ControlledContext>,
@@ -504,6 +510,9 @@ impl Connection {
             show_my_cursor: false,
             tx_input,
             video_ack_required: false,
+            video_send_max_ms: 0,
+            video_send_sum_ms: 0,
+            video_send_count: 0,
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
             controlled_context,
@@ -950,9 +959,16 @@ impl Connection {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
+                    let send_begin = video_service::qos_diag_verbose().then(Instant::now);
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
+                    }
+                    if let Some(begin) = send_begin {
+                        let blocked = begin.elapsed().as_millis() as u32;
+                        conn.video_send_max_ms = conn.video_send_max_ms.max(blocked);
+                        conn.video_send_sum_ms = conn.video_send_sum_ms.saturating_add(blocked);
+                        conn.video_send_count += 1;
                     }
                 },
                 Some((instant, value)) = rx.recv() => {
@@ -1039,6 +1055,21 @@ impl Connection {
                             conn.on_close("auto disconnect", true).await;
                             break;
                         }
+                    }
+                    if video_service::qos_diag_verbose() && conn.video_send_count > 0 {
+                        // Joined with `qos_trace` on `t`: a probe that waits behind a
+                        // blocked write is not a slow network.
+                        log::debug!(
+                            "qos_send t={} id={id} frames={} send_max={} send_sum={} queued={}",
+                            hbb_common::get_time(),
+                            conn.video_send_count,
+                            conn.video_send_max_ms,
+                            conn.video_send_sum_ms,
+                            rx_video.len()
+                        );
+                        conn.video_send_max_ms = 0;
+                        conn.video_send_sum_ms = 0;
+                        conn.video_send_count = 0;
                     }
                     conn.file_remove_log_control.on_timer().drain(..).map(|x| conn.send_to_cm(x)).count();
                     #[cfg(feature = "hwcodec")]
@@ -5097,7 +5128,11 @@ impl Connection {
         // But it's not necessary now and we have to consider two audio services(client, server).
         crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
-        if lock && self.lock_after_session_end && self.keyboard {
+        if lock
+            && self.lock_after_session_end
+            && self.keyboard
+            && !raii::AuthedConnID::session_reconnected(self.inner.id(), &self.session_key())
+        {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             lock_screen().await;
         }
@@ -6658,6 +6693,21 @@ mod raii {
     pub struct AuthedConnID(i32, AuthConnType);
 
     impl AuthedConnID {
+        pub(super) fn is_newer_session_remote(c: &AuthedConn, id: i32, key: &SessionKey) -> bool {
+            c.conn_id > id && c.conn_type == AuthConnType::Remote && &c.session_key == key
+        }
+
+        /// Whether a newer remote control connection of this session has replaced this one. A
+        /// controlling peer whose link dies reconnects while the connection it left behind runs
+        /// on here until its own timeout; locking for that one would lock a session that has
+        /// already resumed on its replacement.
+        pub fn session_reconnected(id: i32, key: &SessionKey) -> bool {
+            let conns = AUTHED_CONNS.lock().unwrap();
+            conns
+                .iter()
+                .any(|c| Self::is_newer_session_remote(c, id, key))
+        }
+
         pub fn new(
             conn_id: i32,
             conn_type: AuthConnType,
@@ -7546,5 +7596,39 @@ mod test {
             scoped.terminal_persistent.enum_value(),
             Ok(BoolOption::NotSet)
         );
+    }
+    #[test]
+    fn only_a_newer_remote_control_of_the_same_session_keeps_the_screen_unlocked() {
+        let replaced_by = super::raii::AuthedConnID::is_newer_session_remote;
+
+        let key = |session_id, peer: &str| SessionKey {
+            peer_id: peer.to_owned(),
+            name: "".to_owned(),
+            session_id,
+        };
+        let conn = |conn_id, conn_type, session_key| AuthedConn {
+            conn_id,
+            conn_type,
+            session_key,
+            sender: mpsc::unbounded_channel().0,
+            printer: false,
+        };
+        let mine = key(7, "peer");
+        let remote = AuthConnType::Remote;
+
+        assert!(replaced_by(&conn(3, remote, mine.clone()), 2, &mine));
+        // An older one, and itself: of connections ending at once only the last still locks.
+        assert!(!replaced_by(&conn(1, remote, mine.clone()), 2, &mine));
+        assert!(!replaced_by(&conn(2, remote, mine.clone()), 2, &mine));
+        // A kind that keeps no screen in use.
+        assert!(!replaced_by(
+            &conn(3, AuthConnType::Terminal, mine.clone()),
+            2,
+            &mine
+        ));
+        // Another session of this peer, and another peer on the same session id: `SessionKey`
+        // is all three fields, and either of those is someone else's screen to lock.
+        assert!(!replaced_by(&conn(3, remote, key(8, "peer")), 2, &mine));
+        assert!(!replaced_by(&conn(3, remote, key(7, "other")), 2, &mine));
     }
 }
