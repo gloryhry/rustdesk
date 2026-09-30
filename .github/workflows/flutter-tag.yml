@@ -2,6 +2,11 @@ name: Flutter Tag Build
 
 on:
   workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Original upstream tag for this customized snapshot
+        required: false
+        type: string
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
@@ -9,10 +14,13 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
 
+permissions:
+  contents: write
+
 jobs:
   run-flutter-tag-build:
     uses: ./.github/workflows/flutter-build.yml
     secrets: inherit
     with:
       upload-artifact: true
-      upload-tag: ${{ github.ref_name }}
+      upload-tag: ${{ inputs.release-tag || github.ref_name }}
