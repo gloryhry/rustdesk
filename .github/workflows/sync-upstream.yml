@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
+    inputs:
+      rebuild-tag:
+        description: Rebuild an upstream release even if a fork release already exists
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -105,6 +110,7 @@ jobs:
 
           before="$(git rev-parse HEAD)"
           upstream="$(git rev-parse upstream/master)"
+          fork_files=(.gitmodules .github/workflows/sync-upstream.yml .github/workflows/build-release.yml .github/workflows/flutter-tag.yml .github/scripts/fork-build.py)
           echo "fork_before=$before" >> "$GITHUB_OUTPUT"
           echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
 
@@ -122,7 +128,9 @@ jobs:
             git merge --ff-only upstream/master
 
             # Re-apply fork-owned files after a pure upstream fast-forward.
-            git checkout "$before" -- .gitmodules .github/workflows/sync-upstream.yml .github/workflows/build-release.yml
+            git checkout "$before" -- "${fork_files[@]}"
+            python3 .github/scripts/fork-build.py repair
+            git add .github/workflows/flutter-build.yml libs/base/src/config/keys.rs
             git update-index --cacheinfo 160000,"$HBB_SHA",libs/hbb_common
             if ! git diff --cached --quiet; then
               git commit -m "chore: restore fork customizations after upstream sync"
@@ -135,8 +143,9 @@ jobs:
             set -e
 
             # These files are owned by this fork and intentionally differ from upstream.
-            git checkout HEAD -- .gitmodules .github/workflows/sync-upstream.yml .github/workflows/build-release.yml
-            git add .gitmodules .github/workflows/sync-upstream.yml .github/workflows/build-release.yml
+            git checkout HEAD -- "${fork_files[@]}"
+            python3 .github/scripts/fork-build.py repair
+            git add "${fork_files[@]}" .github/workflows/flutter-build.yml libs/base/src/config/keys.rs
 
             # The superproject must point at the synchronized customized hbb_common fork.
             git update-index --cacheinfo 160000,"$HBB_SHA",libs/hbb_common
@@ -168,6 +177,8 @@ jobs:
       - name: Detect and synchronize upstream tags
         id: tags
         shell: bash
+        env:
+          TAG_PUSH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -191,10 +202,15 @@ jobs:
           count="$(wc -l < "$changed_tags" | tr -d ' ')"
           echo "changed_count=$count" >> "$GITHUB_OUTPUT"
 
+          # GITHUB_TOKEN pushes leave upstream tags intact without launching their old workflows.
+          tag_auth="$(printf 'x-access-token:%s' "$TAG_PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$tag_auth"
           while IFS= read -r tag; do
             [[ -n "$tag" ]] || continue
             git fetch upstream "+refs/tags/$tag:refs/tags/$tag"
-            git push origin "+refs/tags/$tag:refs/tags/$tag"
+            git -c http.https://github.com/.extraheader= \
+              -c http.https://github.com/.extraheader="AUTHORIZATION: basic $tag_auth" \
+              push origin "+refs/tags/$tag:refs/tags/$tag"
           done < "$changed_tags"
 
           {
@@ -209,6 +225,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          REBUILD_TAG: ${{ inputs.rebuild-tag }}
         run: |
           set -euo pipefail
 
@@ -260,6 +277,16 @@ jobs:
           done < "$pending"
           mv "$filtered" "$pending"
 
+          if [[ -n "$REBUILD_TAG" ]]; then
+            if [[ ! "$REBUILD_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]] || \
+              ! jq -e --arg tag "$REBUILD_TAG" '.[] | select(.tag_name == $tag)' "$upstream_json" >/dev/null; then
+              echo "::error::rebuild-tag must name a published upstream release."
+              exit 1
+            fi
+            echo "$REBUILD_TAG" >> "$pending"
+            sort -u -o "$pending" "$pending"
+          fi
+
           count="$(wc -l < "$pending" | tr -d ' ')"
           echo "pending_count=$count" >> "$GITHUB_OUTPUT"
           {
@@ -268,7 +295,7 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Rebuild and publish upstream releases from tags
+      - name: Prepare and build customized upstream releases
         if: steps.releases.outputs.pending_count != '0'
         shell: bash
         env:
@@ -278,7 +305,10 @@ jobs:
           set -euo pipefail
           while IFS= read -r tag; do
             [[ -n "$tag" ]] || continue
-            gh workflow run flutter-tag.yml --repo "$GH_REPO" --ref "$tag"
+            release_ref="$(python3 .github/scripts/fork-build.py prepare-release \
+              --hbb _sync_hbb_common --tag "$tag")"
+            gh workflow run flutter-tag.yml --repo "$GH_REPO" --ref "$release_ref" -f release-tag="$tag"
+            echo "- $tag build source: \`$release_ref\`" >> "$GITHUB_STEP_SUMMARY"
           done <<< "${{ steps.releases.outputs.pending_tags }}"
 
       - name: Trigger custom nightly build for synchronized master
