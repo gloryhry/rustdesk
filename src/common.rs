@@ -3243,7 +3243,15 @@ mod tests {
             "1:2".to_string(),
         );
 
-        assert_eq!(get_tcp_proxy_addr(), format!("[1:2]:{RENDEZVOUS_PORT}"));
+        if Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER) != "1:2" {
+            // The fork refuses a server override, so the proxy must use its locked endpoint.
+            assert_eq!(
+                get_tcp_proxy_addr(),
+                format!("{}:{RENDEZVOUS_PORT}", hbb_common::config::RENDEZVOUS_SERVERS[0])
+            );
+        } else {
+            assert_eq!(get_tcp_proxy_addr(), format!("[1:2]:{RENDEZVOUS_PORT}"));
+        }
     }
 
     #[tokio::test]
