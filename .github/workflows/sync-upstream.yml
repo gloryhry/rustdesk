@@ -194,8 +194,11 @@ jobs:
             | awk '{sub("refs/tags/", "", $2); print $2 " " $1}' \
             | sort > "$upstream_tags"
 
+          # 1.5.0 is a fork-owned rolling release built from our current master.
+          # Never replace its ref with the upstream tag during scheduled sync.
           awk '
             NR==FNR { origin[$1]=$2; next }
+            $1 == "1.5.0" { next }
             !($1 in origin) || origin[$1] != $2 { print $1 }
           ' "$origin_tags" "$upstream_tags" > "$changed_tags"
 
