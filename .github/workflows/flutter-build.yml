@@ -1120,9 +1120,6 @@ jobs:
     concurrency:
       group: signed-update-${{ inputs.upload-tag }}
       cancel-in-progress: false
-    permissions:
-      # Required to inspect and publish signed release assets for the target tag.
-      contents: write
     steps:
       - name: Refuse to replace published update metadata
         shell: bash
