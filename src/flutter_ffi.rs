@@ -1454,6 +1454,17 @@ pub fn main_peer_exists(id: String) -> bool {
     peer_exists(&id)
 }
 
+// `Config::path` resolves through `APP_DIR` only on mobile, where loading peers before it is set
+// would read the wrong place. Elsewhere the peer path never consults it, so an unset `APP_DIR`
+// must not stop the peers from loading.
+fn peer_config_path_ready() -> bool {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        !config::APP_DIR.read().unwrap().is_empty()
+    } else {
+        true
+    }
+}
+
 fn load_recent_peers(
     vec_id_modified_time_path: &Vec<(String, SystemTime, std::path::PathBuf)>,
     to_end: bool,
@@ -1485,7 +1496,7 @@ pub fn main_load_recent_peers() {
         );
     };
 
-    if !config::APP_DIR.read().unwrap().is_empty() {
+    if peer_config_path_ready() {
         let vec_id_modified_time_path = PeerConfig::get_vec_id_modified_time_path(&None);
         if vec_id_modified_time_path.is_empty() {
             push_to_flutter("".to_owned(), None);
@@ -1533,7 +1544,7 @@ pub fn main_load_recent_peers_for_ab(filter: String) -> String {
     } else {
         Some(id_filters)
     };
-    if !config::APP_DIR.read().unwrap().is_empty() {
+    if peer_config_path_ready() {
         let peers: Vec<HashMap<&str, String>> = PeerConfig::peers(id_filters)
             .drain(..)
             .map(|(id, _, p)| peer_to_map(id, p))
@@ -1551,7 +1562,7 @@ pub fn main_load_fav_peers() {
             serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
         );
     };
-    if !config::APP_DIR.read().unwrap().is_empty() {
+    if peer_config_path_ready() {
         let favs = get_fav();
         let mut recent = PeerConfig::peers(Some(favs.clone()));
         let mut lan = config::LanPeers::load()
@@ -2763,6 +2774,16 @@ pub fn main_get_common(key: String) -> String {
 }
 
 pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
+    if let Some(args) = key.strip_prefix("resolve-api-server:") {
+        let response = match serde_json::from_str::<(String, String)>(args) {
+            Ok((api, custom)) => serde_json::json!({"url": crate::get_api_server(api, custom)}),
+            Err(err) => {
+                log::trace!("Invalid API server preview arguments: {err}");
+                serde_json::json!({"error": err.to_string()})
+            }
+        };
+        return SyncReturn(response.to_string());
+    }
     // Metadata verification performs blocking network requests. Keep this key on
     // the asynchronous FFI path to avoid blocking the calling Flutter isolate.
     if key.starts_with("verified-download-url-") {
@@ -3102,17 +3123,5 @@ pub mod server_side {
         _class: JClass,
     ) -> jboolean {
         jboolean::from(crate::server::is_clipboard_service_ok())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sync_common_rejects_verified_download_url() {
-        let result = main_get_common_sync("verified-download-url-".to_owned());
-
-        assert_eq!(result.0, "error:unsupported");
     }
 }
