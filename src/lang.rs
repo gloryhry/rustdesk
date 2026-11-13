@@ -183,6 +183,11 @@ fn resolve_lang(saved_lang: &str, locale: &str, cjk_fallback: bool) -> String {
         } else if lang == "in" {
             lang = "id".to_owned();
         }
+        // Norwegian also comes as the macrolanguage code (no_NO) or as Nynorsk (nn_NO);
+        // the only Norwegian table is Bokmål.
+        if lang == "no" || lang == "nn" {
+            lang = "nb".to_owned();
+        }
     }
     if cjk_fallback && is_cjk_lang(&lang) {
         "en".to_owned()
@@ -393,6 +398,15 @@ mod test {
     }
 
     #[test]
+    fn test_resolve_lang_detects_norwegian_from_no_and_nn_locales() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("", "no_NO.UTF-8", false), "nb");
+        assert_eq!(f("", "nn-NO", false), "nb");
+        assert_eq!(f("", "nb-NO", false), "nb");
+    }
+
+    #[test]
     fn test_resolve_lang_detects_hebrew_and_indonesian_from_legacy_android_codes() {
         use super::resolve_lang as f;
 
@@ -444,6 +458,22 @@ mod test {
                     value.matches("{}").count(),
                     "{key:?} => {value:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_translations_spell_the_app_name_as_rustdesk() {
+        use super::*;
+
+        // translate() swaps the exact "RustDesk" for a custom client's name, so any other
+        // spelling stays visible in custom clients.
+        let re = hbb_common::regex::Regex::new(r"(?i)\brus?t?desk\b").unwrap();
+        for table in [&*da::T, &*el::T, &*es::T, &*nl::T, &*uk::T] {
+            for (key, value) in table.iter() {
+                for found in re.find_iter(value) {
+                    assert_eq!(found.as_str(), "RustDesk", "{key:?} => {value:?}");
+                }
             }
         }
     }
