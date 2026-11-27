@@ -73,6 +73,10 @@ pub const OPTION_ENABLE_HWCODEC: &str = "enable-hwcodec";
 pub const OPTION_APPROVE_MODE: &str = "approve-mode";
 pub const OPTION_VERIFICATION_METHOD: &str = "verification-method";
 pub const OPTION_TEMPORARY_PASSWORD_LENGTH: &str = "temporary-password-length";
+<<<<<<< HEAD
+=======
+pub const OPTION_API_IDLE_HEARTBEAT_INTERVAL_SECONDS: &str = "api-idle-heartbeat-interval-seconds";
+>>>>>>> upstream/master
 pub const OPTION_PRESET_ADDRESS_BOOK_NAME: &str = "preset-address-book-name";
 pub const OPTION_PRESET_ADDRESS_BOOK_TAG: &str = "preset-address-book-tag";
 pub const OPTION_PRESET_ADDRESS_BOOK_ALIAS: &str = "preset-address-book-alias";
@@ -308,6 +312,7 @@ pub const KEYS_SETTINGS: &[&str] = &[
     OPTION_PROXY_PASSWORD,
     OPTION_CUSTOM_RENDEZVOUS_SERVER,
     OPTION_API_SERVER,
+    OPTION_API_IDLE_HEARTBEAT_INTERVAL_SECONDS,
     OPTION_KEY,
     OPTION_ALLOW_WEBSOCKET,
     OPTION_WEBSOCKET_PORT,
